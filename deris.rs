@@ -22,7 +22,7 @@ fn main() {
     ) |new_conn, kill_ch| {
         io::println("New client");
 
-        let (port, channel) = comm::stream::<option::Option<tcp::TcpErrData>>();
+        let (port, channel) = comm::stream::<Option<tcp::TcpErrData>>();
         let localARC = dataARC.clone();
 
         do task::spawn_supervised {
@@ -45,7 +45,7 @@ fn main() {
                                 sockbuf.write_str(msg);
                             },
                             Ok(args) => {
-                                let response = cmd_dispatcher(localARC.clone(), args);
+                                let response = cmd_dispatcher(&localARC, args);
                                 sockbuf.write(response);
                             }
                         }
@@ -123,7 +123,7 @@ fn parse_args(buf: tcp::TcpSocketBuf) -> Result<~[~[u8]], ~str> {
     Ok(args)
 }
 
-fn cmd_dispatcher(arc: RWARC<~LinearMap<~[u8], ~[u8]>>, args: ~[~[u8]]) -> ~[u8] {
+fn cmd_dispatcher(arc: &RWARC<~LinearMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> ~[u8] {
     let command = str::from_bytes(args[0]).to_lower();
 
     //io::println(fmt!("%s: %?", command, args));
@@ -142,7 +142,10 @@ fn cmd_dispatcher(arc: RWARC<~LinearMap<~[u8], ~[u8]>>, args: ~[~[u8]]) -> ~[u8]
         }
     } else if command == ~"set" {
         do arc.write() |data| {
-            data.insert(copy args[1], copy args[2]);
+            args.truncate(3);
+            let val = args.pop();
+            let key = args.pop();
+            data.insert(key, val);
 
             output = "+OK\r\n".to_bytes();
         }
