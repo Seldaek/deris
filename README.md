@@ -14,6 +14,7 @@ Supported features
 - Redis protocol
 - GET
 - SET (no flags)
+- INCR/DECR/INCRBY/DECRBY
 
 Author
 ------

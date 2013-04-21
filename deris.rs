@@ -38,6 +38,7 @@ fn main() {
                     channel.send(None);
 
                     let sockbuf = tcp::socket_buf(sock);
+                    let crlf = "\r\n".to_bytes();
                     loop {
                         let parse_res = parse_args(sockbuf);
                         match parse_res {
@@ -49,6 +50,7 @@ fn main() {
                                 sockbuf.write(response);
                             }
                         }
+                        sockbuf.write(crlf);
                     }
                 }
             }
@@ -135,9 +137,8 @@ fn cmd_dispatcher(arc: &RWARC<~LinearMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> 
             if res.is_some() {
                 output = str::concat(~[~"$", res.unwrap().len().to_str(), ~"\r\n"]).to_bytes();
                 vec::push_all(&mut output, *res.unwrap());
-                vec::push_all(&mut output, "\r\n".to_bytes());
             } else {
-                output = "$-1\r\n".to_bytes();
+                output = "$-1".to_bytes();
             }
         }
     } else if command == ~"set" {
@@ -147,10 +148,54 @@ fn cmd_dispatcher(arc: &RWARC<~LinearMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> 
             let key = args.pop();
             data.insert(key, val);
 
-            output = "+OK\r\n".to_bytes();
+            output = "+OK".to_bytes();
+        }
+    } else if command == ~"incr" || command == ~"decr" || command == ~"incrby" || command == ~"decrby" {
+        let mut cur_val = 0;
+
+        do arc.read() |data| {
+            let res = data.find(&args[1]);
+
+            if res.is_some() {
+                match int::parse_bytes(*res.unwrap(), 10) {
+                    Some(val) => {
+                        cur_val = val;
+                    },
+                    None => {
+                        output = "-ERR value is not an integer or out of range".to_bytes();
+                    }
+                }
+            }
+        }
+
+        let mut incr_by = 1;
+        if command == ~"incrby" || command == ~"decrby" {
+            args.truncate(3);
+            match int::parse_bytes(args.pop(), 10) {
+                Some(val) => {
+                    incr_by = val;
+                },
+                None => {
+                    output = "-ERR incrby argument is not an integer or out of range".to_bytes();
+                }
+            }
+        }
+        if command == ~"decr" || command == ~"decrby" {
+            incr_by = -incr_by;
+        }
+
+        if output.len() == 0 {
+            do arc.write() |data| {
+                args.truncate(2);
+                let key = args.pop();
+                let new_val = (cur_val + incr_by).to_str().to_bytes();
+                output = ":".to_bytes();
+                vec::push_all(&mut output, new_val);
+                data.insert(key, new_val);
+            }
         }
     } else {
-        output = fmt!("-ERR unknown command '%s'\r\n", command).to_bytes();
+        output = fmt!("-ERR unknown command '%s'", command).to_bytes();
     }
 
     output
