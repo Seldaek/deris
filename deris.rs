@@ -44,13 +44,14 @@ fn main() {
                         match parse_res {
                             Err(msg) => {
                                 sockbuf.write_str(msg);
+                                sockbuf.write(crlf);
                             },
                             Ok(args) => {
-                                let response = cmd_dispatcher(&localARC, args);
+                                let mut response = cmd_dispatcher(&localARC, args);
+                                vec::push_all(&mut response, crlf);
                                 sockbuf.write(response);
                             }
                         }
-                        sockbuf.write(crlf);
                     }
                 }
             }
