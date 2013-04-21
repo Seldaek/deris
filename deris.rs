@@ -10,8 +10,8 @@ fn main() {
     let iotask = &uv::global_loop::get();
     let port = 6380;
 
-    let mut data = ~LinearMap::new::<~str, ~str>();
-    let arc = RWARC(data);
+    let mut data = ~LinearMap::new::<~[u8], ~[u8]>();
+    let dataARC = RWARC(data);
 
     let listen_res = do tcp::listen(ip::v4::parse_addr("127.0.0.1"), port, 1000, iotask,
         |_kill_ch| {
@@ -23,33 +23,37 @@ fn main() {
         io::println("New client");
 
         let (port, channel) = comm::stream::<option::Option<tcp::TcpErrData>>();
-        let localARC = arc.clone();
-        do task::spawn {
+        let localARC = dataARC.clone();
+
+        do task::spawn_supervised {
             let accept_result = tcp::accept(new_conn);
             match accept_result {
                 Err(accept_error) => {
-                    io::println("Failed!");
+                    io::stderr().write_line("Failed to accept connection");
                     channel.send(Some(accept_error));
-                    // fail?
                 },
                 Ok(sock) => {
-                    io::println("Accepted!");
+                    let peer_addr = &sock.get_peer_addr();
+                    io::println(fmt!("Client connected: %s on port %u", ip::format_addr(peer_addr), ip::get_port(peer_addr)));
                     channel.send(None);
-                    // do work here
-                    let s = ~"Hello\n";
-                    do str::as_bytes(&s) |&bytes| {
-                        sock.write(bytes);
-                    }
 
                     let sockbuf = tcp::socket_buf(sock);
                     loop {
-                        let command = sockbuf.read_line();
-                        let s = cmd_dispatcher(localARC.clone(), command);
-                        sockbuf.write_line(s);
+                        let parse_res = parse_args(sockbuf);
+                        match parse_res {
+                            Err(msg) => {
+                                sockbuf.write_str(msg);
+                            },
+                            Ok(args) => {
+                                let response = cmd_dispatcher(localARC.clone(), args);
+                                sockbuf.write(response);
+                            }
+                        }
                     }
                 }
             }
         };
+
         match port.recv() {
           // shut down listen()
           Some(err_data) => kill_ch.send(Some(err_data)),
@@ -59,43 +63,92 @@ fn main() {
     };
 
     if listen_res.is_err() {
-        io::println(fmt!("Failed to bind address: %?", listen_res.get_err()));
+        io::stderr().write_line(fmt!("Failed to bind address: %?", listen_res.get_err()));
     }
 }
 
-fn cmd_dispatcher(arc: RWARC<~LinearMap<~str, ~str>>, input: &str) -> ~str {
+fn parse_args(buf: tcp::TcpSocketBuf) -> Result<~[~[u8]], ~str> {
+    let first_char = buf.read_char();
+    let has_arg_count = first_char == '*';
     let mut args = ~[];
 
-    for str::each_split_char_nonempty(input, ' ') |word| {
-        args.push(word.to_str());
+    if has_arg_count {
+        let mut arg_count;
+        match uint::from_str(buf.read_until('\r', false)) {
+            Some(count) => {
+                arg_count = count;
+            },
+            None => {
+                return Err(~"Could not parse argument count as uint");
+            }
+        }
+
+        // discard \n
+        buf.read_byte();
+
+        while arg_count > 0 {
+            let chr = buf.read_char();
+            let has_arg_len = chr == '$';
+            if !has_arg_len {
+                return Err(fmt!("No argument length found, expected $n, got %?", chr));
+            }
+            let arg_len;
+            match uint::from_str(buf.read_until('\r', false)) {
+                Some(count) => {
+                    arg_len = count;
+                },
+                None => {
+                    return Err(~"Could not parse argument length as uint");
+                }
+            }
+            // discard \n
+            buf.read_byte();
+
+            args.push(buf.read_bytes(arg_len));
+            arg_count -= 1;
+
+            // discard \r\n
+            buf.read_bytes(2);
+        }
+    } else {
+        let input = str::append(str::from_char(first_char), buf.read_until('\r', false));
+        // discard \n
+        buf.read_char();
+
+        for str::each_split_char_nonempty(input, ' ') |word| {
+            args.push(word.to_bytes());
+        }
     }
 
-    // remove trailing \r
-    str::pop_char(&mut args[args.len()-1]);
+    Ok(args)
+}
 
-    // grab command
-    let command = args.shift();
+fn cmd_dispatcher(arc: RWARC<~LinearMap<~[u8], ~[u8]>>, args: ~[~[u8]]) -> ~[u8] {
+    let command = str::from_bytes(args[0]).to_lower();
 
-    io::println(fmt!("%s: %?", command, args));
+    //io::println(fmt!("%s: %?", command, args));
 
-    let mut output = ~"-ERR Command not found";
-
+    let mut output = ~[];
     if command == ~"get" {
         do arc.read() |data| {
-            let res = data.find(&args[0]);
+            let res = data.find(&args[1]);
             if res.is_some() {
-                output = res.unwrap().to_str();
+                output = str::concat(~[~"$", res.unwrap().len().to_str(), ~"\r\n"]).to_bytes();
+                vec::push_all(&mut output, *res.unwrap());
+                vec::push_all(&mut output, "\r\n".to_bytes());
             } else {
-                output = ~"$-1";
+                output = "$-1\r\n".to_bytes();
             }
         }
     } else if command == ~"set" {
         do arc.write() |data| {
-            data.insert(args[0].to_str(), args[1].to_str());
+            data.insert(copy args[1], copy args[2]);
 
-            output = ~"+OK";
+            output = "+OK\r\n".to_bytes();
         }
+    } else {
+        output = fmt!("-ERR unknown command '%s'\r\n", command).to_bytes();
     }
 
-    return output;
+    output
 }
