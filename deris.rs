@@ -1,26 +1,28 @@
-extern mod std;
-use std::net::tcp;
-use std::net::ip;
-use std::uv;
-use std::arc::RWARC;
-use core::hashmap::linear::LinearMap; // core::hashmap::HashMap in 0.7
+extern mod extra;
+
+use extra::net::tcp;
+use extra::net::ip;
+use extra::uv;
+use extra::arc::RWARC;
+use std::{str, io, int, uint, task, comm};
+use std::hashmap::HashMap;
 
 fn main() {
-    io::println("Started");
+    println("Started");
     let iotask = &uv::global_loop::get();
     let port = 6380;
 
-    let mut data = ~LinearMap::new::<~[u8], ~[u8]>();
+    let data = ~HashMap::new::<~[u8], ~[u8]>();
     let dataARC = RWARC(data);
 
     let listen_res = do tcp::listen(ip::v4::parse_addr("127.0.0.1"), port, 1000, iotask,
         |_kill_ch| {
             // pass the kill_ch to your main loop or wherever you want
             // to be able to externally kill the server from
-            io::println(fmt!("Server is listening on port %u", port));
+            println(fmt!("Server is listening on port %u", port));
         }
     ) |new_conn, kill_ch| {
-        io::println("New client");
+        println("New client");
 
         let (port, channel) = comm::stream::<Option<tcp::TcpErrData>>();
         let localARC = dataARC.clone();
@@ -34,34 +36,34 @@ fn main() {
                 },
                 Ok(sock) => {
                     let peer_addr = &sock.get_peer_addr();
-                    io::println(fmt!("Client connected: %s on port %u", ip::format_addr(peer_addr), ip::get_port(peer_addr)));
+                    println(fmt!("Client connected: %s on port %u", ip::format_addr(peer_addr), ip::get_port(peer_addr)));
                     channel.send(None);
 
                     let sockbuf = tcp::socket_buf(sock);
-                    let crlf = "\r\n".to_bytes();
+                    let crlf = bytes!("\r\n");
                     loop {
                         let parse_res = parse_args(sockbuf);
+                        let mut response;
                         match parse_res {
                             Err(msg) => {
-                                sockbuf.write_str(msg);
-                                sockbuf.write(crlf);
+                                response = msg.as_bytes().to_owned();
                             },
                             Ok(args) => {
-                                let mut response = cmd_dispatcher(&localARC, args);
-                                vec::push_all(&mut response, crlf);
-                                sockbuf.write(response);
+                                response = cmd_dispatcher(&localARC, args);
                             }
                         }
+                        response.push_all(crlf);
+                        sockbuf.write(response);
                     }
                 }
             }
         };
 
         match port.recv() {
-          // shut down listen()
-          Some(err_data) => kill_ch.send(Some(err_data)),
-          // wait for next connection
-          None => ()
+            // shut down listen()
+            Some(err_data) => kill_ch.send(Some(err_data)),
+            // wait for next connection
+            None => ()
         }
     };
 
@@ -77,7 +79,7 @@ fn parse_args(buf: tcp::TcpSocketBuf) -> Result<~[~[u8]], ~str> {
 
     if has_arg_count {
         let mut arg_count;
-        match uint::from_str(buf.read_until('\r', false)) {
+        match uint::from_str(buf.read_until('\r'.to_ascii().to_byte(), false)) {
             Some(count) => {
                 arg_count = count;
             },
@@ -96,7 +98,7 @@ fn parse_args(buf: tcp::TcpSocketBuf) -> Result<~[~[u8]], ~str> {
                 return Err(fmt!("No argument length found, expected $n, got %?", chr));
             }
             let arg_len;
-            match uint::from_str(buf.read_until('\r', false)) {
+            match uint::from_str(buf.read_until('\r'.to_ascii().to_byte(), false)) {
                 Some(count) => {
                     arg_len = count;
                 },
@@ -114,42 +116,50 @@ fn parse_args(buf: tcp::TcpSocketBuf) -> Result<~[~[u8]], ~str> {
             buf.read_bytes(2);
         }
     } else {
-        let input = str::append(str::from_char(first_char), buf.read_until('\r', false));
+        let input = str::from_char(first_char);
+        let input = input.append(buf.read_until('\r'.to_ascii().to_byte(), false));
+
         // discard \n
         buf.read_char();
 
-        for str::each_split_char_nonempty(input, ' ') |word| {
-            args.push(word.to_bytes());
-        }
+        let words: ~[&str] = input.split_iter(' ').collect();
+        args = words.map(|word| {
+            word.as_bytes().to_owned()
+        })
     }
 
     Ok(args)
 }
 
-fn cmd_dispatcher(arc: &RWARC<~LinearMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> ~[u8] {
-    let command = str::from_bytes(args[0]).to_lower();
+fn cmd_dispatcher(arc: &RWARC<~HashMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> ~[u8] {
+    let command = args[0].to_ascii().to_lower().into_str().to_owned();
 
-    //io::println(fmt!("%s: %?", command, args));
+    //println(fmt!("%s: %?", command, args));
 
     let mut output = ~[];
     if command == ~"get" {
         do arc.read() |data| {
             let res = data.find(&args[1]);
             if res.is_some() {
-                output = str::concat(~[~"$", res.unwrap().len().to_str(), ~"\r\n"]).to_bytes();
-                vec::push_all(&mut output, *res.unwrap());
+                let result = [~"$", res.unwrap().len().to_str(), ~"\r\n"].concat();
+                output = result.as_bytes().to_owned();
+                output.push_all(*res.unwrap());
             } else {
-                output = "$-1".to_bytes();
+                output = bytes!("$-1").to_owned();
             }
         }
     } else if command == ~"set" {
-        do arc.write() |data| {
-            args.truncate(3);
-            let val = args.pop();
-            let key = args.pop();
-            data.insert(key, val);
+        if (args.len() < 3) {
+            output = bytes!("-ERR wrong number of arguments for 'set' command").to_owned();
+        } else {
+            do arc.write() |data| {
+                args.truncate(3);
+                let val = args.pop();
+                let key = args.pop();
+                data.insert(key, val);
 
-            output = "+OK".to_bytes();
+                output = bytes!("+OK").to_owned();
+            }
         }
     } else if command == ~"incr" || command == ~"decr" || command == ~"incrby" || command == ~"decrby" {
         let mut cur_val = 0;
@@ -163,7 +173,7 @@ fn cmd_dispatcher(arc: &RWARC<~LinearMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> 
                         cur_val = val;
                     },
                     None => {
-                        output = "-ERR value is not an integer or out of range".to_bytes();
+                        output = bytes!("-ERR value is not an integer or out of range").to_owned();
                     }
                 }
             }
@@ -177,7 +187,7 @@ fn cmd_dispatcher(arc: &RWARC<~LinearMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> 
                     incr_by = val;
                 },
                 None => {
-                    output = "-ERR incrby argument is not an integer or out of range".to_bytes();
+                    output = bytes!("-ERR incrby argument is not an integer or out of range").to_owned();
                 }
             }
         }
@@ -189,14 +199,16 @@ fn cmd_dispatcher(arc: &RWARC<~LinearMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> 
             do arc.write() |data| {
                 args.truncate(2);
                 let key = args.pop();
-                let new_val = (cur_val + incr_by).to_str().to_bytes();
-                output = ":".to_bytes();
-                vec::push_all(&mut output, new_val);
+                let new_val = (cur_val + incr_by).to_str();
+                let new_val = new_val.as_bytes().to_owned();
+                output = bytes!(":").to_owned();
+                output.push_all(new_val);
                 data.insert(key, new_val);
             }
         }
     } else {
-        output = fmt!("-ERR unknown command '%s'", command).to_bytes();
+        let result = fmt!("-ERR unknown command '%s'", command);
+        output = result.as_bytes().to_owned();
     }
 
     output
