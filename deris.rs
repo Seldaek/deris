@@ -1,85 +1,90 @@
 extern mod extra;
 
-use extra::net::tcp;
-use extra::net::ip;
-use extra::uv;
-use extra::arc::RWARC;
-use std::{str, io, int, uint, task, comm};
+use std::cell::Cell;
+use std::rt::io::net::tcp::{TcpListener, TcpStream};
+use std::rt::io::net::ip::Ipv4;
+use std::rt::io::{Listener, Reader, ReaderUtil, Writer};
+use extra::arc::RWArc;
 use std::hashmap::HashMap;
+use std::{uint, int, str};
 
 fn main() {
     println("Started");
-    let iotask = &uv::global_loop::get();
-    let port = 6380;
 
     let data = ~HashMap::new::<~[u8], ~[u8]>();
-    let dataARC = RWARC(data);
+    let data_arc = RWArc::new(data);
 
-    let listen_res = do tcp::listen(ip::v4::parse_addr("127.0.0.1"), port, 1000, iotask,
-        |_kill_ch| {
-            // pass the kill_ch to your main loop or wherever you want
-            // to be able to externally kill the server from
-            println(fmt!("Server is listening on port %u", port));
-        }
-    ) |new_conn, kill_ch| {
-        println("New client");
+    let port = 6380;
+    let mut listener = TcpListener::bind(Ipv4(127, 0, 0, 1, port)).expect("Unable to bind to 127.0.0.1:6380");
+    println(fmt!("Server is listening on %s", listener.socket_name().expect("").to_str()));
 
-        let (port, channel) = comm::stream::<Option<tcp::TcpErrData>>();
-        let localARC = dataARC.clone();
+    loop {
+        let stream = Cell::new(listener.accept());
 
-        do task::spawn_supervised {
-            let accept_result = tcp::accept(new_conn);
-            match accept_result {
-                Err(accept_error) => {
-                    io::stderr().write_line("Failed to accept connection");
-                    channel.send(Some(accept_error));
-                },
-                Ok(sock) => {
-                    let peer_addr = &sock.get_peer_addr();
-                    println(fmt!("Client connected: %s on port %u", ip::format_addr(peer_addr), ip::get_port(peer_addr)));
-                    channel.send(None);
+        let local_arc = data_arc.clone();
 
-                    let sockbuf = tcp::socket_buf(sock);
-                    let crlf = bytes!("\r\n");
-                    loop {
-                        let parse_res = parse_args(sockbuf);
-                        let mut response;
-                        match parse_res {
-                            Err(msg) => {
-                                response = msg.as_bytes().to_owned();
-                            },
-                            Ok(args) => {
-                                response = cmd_dispatcher(&localARC, args);
-                            }
-                        }
-                        response.push_all(crlf);
-                        sockbuf.write(response);
+        do std::task::spawn_supervised {
+            let mut stream = stream.take().unwrap();
+            println(fmt!("Client connected: %s", stream.peer_name().expect("").to_str()));
+
+            let crlf = bytes!("\r\n");
+            loop {
+                let parse_res = parse_args(&mut stream);
+                let mut response;
+                match parse_res {
+                    Err(msg) => {
+                        response = msg.as_bytes().to_owned();
+                    },
+                    Ok(args) => {
+                        response = cmd_dispatcher(&local_arc, args);
                     }
                 }
+                response.push_all(crlf);
+                stream.write(response);
             }
-        };
-
-        match port.recv() {
-            // shut down listen()
-            Some(err_data) => kill_ch.send(Some(err_data)),
-            // wait for next connection
-            None => ()
         }
-    };
-
-    if listen_res.is_err() {
-        io::stderr().write_line(fmt!("Failed to bind address: %?", listen_res.get_err()));
     }
 }
 
-fn parse_args(buf: tcp::TcpSocketBuf) -> Result<~[~[u8]], ~str> {
-    let first_char = buf.read_char();
-    let has_arg_count = first_char == '*';
+fn read_byte(stream: &mut TcpStream) -> u8 {
+    stream.read_byte().expect("")
+}
+
+fn read_bytes(stream: &mut TcpStream, len: uint) -> ~[u8] {
+    let mut buffer = std::vec::with_capacity::<u8>(len);
+
+    for i in range(0, len) {
+        buffer[i] = stream.read_byte().expect("");
+    }
+
+    buffer
+}
+
+fn read_until(stream: &mut TcpStream, until: u8) -> ~[u8] {
+    let mut buffer: ~[u8] = ~[];
+
+    loop {
+        let byte = stream.read_byte().expect("");
+        if byte == until {
+            break
+        }
+        buffer.push(byte);
+    }
+
+    buffer
+}
+
+static CR: u8 = '\r' as u8;
+static STAR: u8 = '*' as u8;
+static DOLLAR: u8 = '$' as u8;
+
+fn parse_args(stream: &mut TcpStream) -> Result<~[~[u8]], ~str> {
+    let first_byte = read_byte(stream);
     let mut args = ~[];
 
-    if has_arg_count {
+    if first_byte == STAR {
         let mut arg_count;
-        match uint::from_str(buf.read_until('\r'.to_ascii().to_byte(), false)) {
+        match uint::parse_bytes(read_until(stream, CR), 10) {
             Some(count) => {
                 arg_count = count;
             },
@@ -89,16 +94,15 @@ fn parse_args(buf: tcp::TcpSocketBuf) -> Result<~[~[u8]], ~str> {
         }
 
         // discard \n
-        buf.read_byte();
+        read_byte(stream);
 
-        while arg_count > 0 {
-            let chr = buf.read_char();
-            let has_arg_len = chr == '$';
-            if !has_arg_len {
-                return Err(fmt!("No argument length found, expected $n, got %?", chr));
+        for _ in range(0, arg_count) {
+            let byte = read_byte(stream);
+            if byte != DOLLAR {
+                return Err(fmt!("No argument length found, expected $, got %?", byte));
             }
             let arg_len;
-            match uint::from_str(buf.read_until('\r'.to_ascii().to_byte(), false)) {
+            match uint::parse_bytes(read_until(stream, CR), 10) {
                 Some(count) => {
                     arg_len = count;
                 },
@@ -107,20 +111,19 @@ fn parse_args(buf: tcp::TcpSocketBuf) -> Result<~[~[u8]], ~str> {
                 }
             }
             // discard \n
-            buf.read_byte();
+            read_byte(stream);
 
-            args.push(buf.read_bytes(arg_len));
-            arg_count -= 1;
+            args.push(stream.read_bytes(arg_len));
 
             // discard \r\n
-            buf.read_bytes(2);
+            stream.read_bytes(2);
         }
     } else {
-        let input = str::from_char(first_char);
-        let input = input.append(buf.read_until('\r'.to_ascii().to_byte(), false));
+        let input = str::from_byte(first_byte);
+        let input = input.append(str::from_bytes(read_until(stream, CR)));
 
         // discard \n
-        buf.read_char();
+        stream.read_byte();
 
         let words: ~[&str] = input.split_iter(' ').collect();
         args = words.map(|word| {
@@ -131,7 +134,7 @@ fn parse_args(buf: tcp::TcpSocketBuf) -> Result<~[~[u8]], ~str> {
     Ok(args)
 }
 
-fn cmd_dispatcher(arc: &RWARC<~HashMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> ~[u8] {
+fn cmd_dispatcher(arc: &RWArc<~HashMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> ~[u8] {
     let command = args[0].to_ascii().to_lower().into_str().to_owned();
 
     //println(fmt!("%s: %?", command, args));
