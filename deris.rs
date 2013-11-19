@@ -1,9 +1,9 @@
 extern mod extra;
 
 use std::cell::Cell;
-use std::rt::io::net::tcp::{TcpListener, TcpStream};
-use std::rt::io::net::ip::Ipv4;
-use std::rt::io::{Listener, Reader, ReaderUtil, Writer};
+use std::io::net::tcp::{TcpListener, TcpStream};
+use std::io::net::ip::SocketAddr;
+use std::io::{Listener, Reader, Writer, Acceptor};
 use extra::arc::RWArc;
 use std::hashmap::HashMap;
 use std::{uint, int, str};
@@ -11,21 +11,24 @@ use std::{uint, int, str};
 fn main() {
     println("Started");
 
-    let data = ~HashMap::new::<~[u8], ~[u8]>();
+    let data: HashMap<~[u8], ~[u8]> = HashMap::new();
     let data_arc = RWArc::new(data);
 
     let port = 6380;
-    let mut listener = TcpListener::bind(Ipv4(127, 0, 0, 1, port)).expect("Unable to bind to 127.0.0.1:6380");
-    println(fmt!("Server is listening on %s", listener.socket_name().expect("").to_str()));
+    let addr: SocketAddr = FromStr::from_str(format!("127.0.0.1:{}", port)).expect("");
+    let mut listener = TcpListener::bind(addr).expect(format!("Unable to bind to 127.0.0.1:{}", port));
+    let sock = listener.socket_name().expect("");
+    let mut acceptor = listener.listen().expect(format!("Could not start listening for connections"));
+    println(format!("Server listening on {}", sock.to_str()));
 
     loop {
-        let stream = Cell::new(listener.accept());
+        let stream = Cell::new(acceptor.accept());
 
         let local_arc = data_arc.clone();
 
         do std::task::spawn_supervised {
             let mut stream = stream.take().unwrap();
-            println(fmt!("Client connected: %s", stream.peer_name().expect("").to_str()));
+            println(format!("New client: {}", stream.peer_name().expect("").to_str()));
 
             let crlf = bytes!("\r\n");
             loop {
@@ -99,7 +102,7 @@ fn parse_args(stream: &mut TcpStream) -> Result<~[~[u8]], ~str> {
         for _ in range(0, arg_count) {
             let byte = read_byte(stream);
             if byte != DOLLAR {
-                return Err(fmt!("No argument length found, expected $, got %?", byte));
+                return Err(format!("No argument length found, expected $, got {}", byte));
             }
             let arg_len;
             match uint::parse_bytes(read_until(stream, CR), 10) {
@@ -120,7 +123,7 @@ fn parse_args(stream: &mut TcpStream) -> Result<~[~[u8]], ~str> {
         }
     } else {
         let input = str::from_byte(first_byte);
-        let input = input.append(str::from_bytes(read_until(stream, CR)));
+        let input = input.append(read_until(stream, CR).to_str());
 
         // discard \n
         stream.read_byte();
@@ -134,10 +137,10 @@ fn parse_args(stream: &mut TcpStream) -> Result<~[~[u8]], ~str> {
     Ok(args)
 }
 
-fn cmd_dispatcher(arc: &RWArc<~HashMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> ~[u8] {
+fn cmd_dispatcher(arc: &RWArc<HashMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> ~[u8] {
     let command = args[0].to_ascii().to_lower().into_str().to_owned();
 
-    //println(fmt!("%s: %?", command, args));
+    //println(format!("{}: %?", command, args));
 
     let mut output = ~[];
     if command == ~"get" {
@@ -210,7 +213,7 @@ fn cmd_dispatcher(arc: &RWArc<~HashMap<~[u8], ~[u8]>>, mut args: ~[~[u8]]) -> ~[
             }
         }
     } else {
-        let result = fmt!("-ERR unknown command '%s'", command);
+        let result = format!("-ERR unknown command '{}'", command);
         output = result.as_bytes().to_owned();
     }
 
